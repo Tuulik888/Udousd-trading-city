@@ -72,6 +72,30 @@ class FakeOandaOrderClient:
         return {"orderFillTransaction": {"tradeOpened": {"tradeID": "fake-1"}}}
 
 
+class FakeTelegramBot:
+    def __init__(self) -> None:
+        self.frozen_calls: list[tuple[str, str]] = []
+        self.daily_halt_calls: list[str] = []
+        self.daily_summary_calls: list[list[dict]] = []
+        self.trade_opened_calls: list[dict] = []
+        self.kill_switch_calls: list[bool] = []
+
+    def notify_agent_frozen(self, agent_name: str, reason: str) -> None:
+        self.frozen_calls.append((agent_name, reason))
+
+    def notify_daily_loss_halt(self, agent_name: str) -> None:
+        self.daily_halt_calls.append(agent_name)
+
+    def notify_daily_summary(self, rows: list[dict]) -> None:
+        self.daily_summary_calls.append(rows)
+
+    def notify_trade_opened(self, agent_name, instrument, direction, units, entry_price) -> None:
+        self.trade_opened_calls.append({"agent_name": agent_name})
+
+    def notify_kill_switch(self, active: bool) -> None:
+        self.kill_switch_calls.append(active)
+
+
 def make_candles(closes: list[float], start: datetime, step_minutes: int = 15) -> list[Candle]:
     candles = []
     t = start
@@ -105,14 +129,23 @@ def library(tmp_path) -> Library:
 
 
 def build_tower(
-    library: Library, candles: list[Candle], claude_response: str = VALID_EMA_JSON
+    library: Library,
+    candles: list[Candle],
+    claude_response: str = VALID_EMA_JSON,
+    telegram_bot: FakeTelegramBot | None = None,
 ) -> tuple[MainTower, FakeOandaOrderClient, RiskVault]:
     cache = CandleCache(db_path=":memory:")
     data_hub = DataHub(client=FakeOandaCandleSource(candles), cache=cache)
     vault = RiskVault(kill_switch_env_var="TEST_MAIN_TOWER_KILL")
     calendar = NewsCalendar([])
     orders_client = FakeOandaOrderClient()
-    paper_park = PaperPark(oanda_client=orders_client, risk_vault=vault, library=library, news_calendar=calendar)
+    paper_park = PaperPark(
+        oanda_client=orders_client,
+        risk_vault=vault,
+        library=library,
+        news_calendar=calendar,
+        telegram_bot=telegram_bot,
+    )
     research_lab = ResearchLab(client=FakeClaudeClient(claude_response), library=library)
 
     tower = MainTower(
@@ -121,6 +154,7 @@ def build_tower(
         data_hub=data_hub,
         library=library,
         risk_vault=vault,
+        telegram_bot=telegram_bot,
     )
     return tower, orders_client, vault
 
@@ -306,3 +340,100 @@ class TestApi:
         tower, *_ = build_tower(library, candles=[])
         client = TestClient(create_app(tower))
         assert client.post("/api/agents/Trend/unfreeze").status_code == 404
+
+    def test_kill_switch_activate_notifies_telegram(self, library: Library):
+        telegram_bot = FakeTelegramBot()
+        tower, *_ = build_tower(library, candles=[], telegram_bot=telegram_bot)
+        client = TestClient(create_app(tower))
+
+        client.post("/api/kill-switch/activate")
+        client.post("/api/kill-switch/deactivate")
+
+        assert telegram_bot.kill_switch_calls == [True, False]
+
+
+# ---------------------------------------------------------------------------
+# Equity sync -> Risk Vault -> Telegram alerts
+# ---------------------------------------------------------------------------
+
+
+class TestSyncEquity:
+    def test_logs_equity_snapshot(self, library: Library):
+        tower, *_ = build_tower(library, candles=[])
+        tower.risk_vault.register_agent("Trend", starting_equity=10_000.0)
+
+        tower.sync_equity("Trend", 10_150.0)
+
+        curve = library.get_equity_curve("Trend")
+        assert len(curve) == 1
+        assert curve[0]["equity"] == pytest.approx(10_150.0)
+
+    def test_notifies_on_new_freeze(self, library: Library):
+        telegram_bot = FakeTelegramBot()
+        tower, *_ = build_tower(library, candles=[], telegram_bot=telegram_bot)
+        tower.risk_vault.register_agent("Trend", starting_equity=10_000.0)
+
+        tower.sync_equity("Trend", 8_500.0)  # >10% drawdown
+
+        assert len(telegram_bot.frozen_calls) == 1
+        assert telegram_bot.frozen_calls[0][0] == "Trend"
+        assert tower.risk_vault.can_trade("Trend") is False
+
+    def test_does_not_renotify_once_already_frozen(self, library: Library):
+        telegram_bot = FakeTelegramBot()
+        tower, *_ = build_tower(library, candles=[], telegram_bot=telegram_bot)
+        tower.risk_vault.register_agent("Trend", starting_equity=10_000.0)
+
+        tower.sync_equity("Trend", 8_500.0)
+        tower.sync_equity("Trend", 8_400.0)  # still frozen
+
+        assert len(telegram_bot.frozen_calls) == 1
+
+    def test_notifies_on_daily_loss_halt(self, library: Library):
+        telegram_bot = FakeTelegramBot()
+        tower, *_ = build_tower(library, candles=[], telegram_bot=telegram_bot)
+        tower.risk_vault.register_agent("Trend", starting_equity=10_000.0)
+
+        tower.sync_equity("Trend", 9_750.0)  # -2.5% daily loss
+
+        assert telegram_bot.daily_halt_calls == ["Trend"]
+        assert telegram_bot.frozen_calls == []
+
+    def test_no_notification_when_no_telegram_bot_configured(self, library: Library):
+        tower, *_ = build_tower(library, candles=[])
+        tower.risk_vault.register_agent("Trend", starting_equity=10_000.0)
+
+        # must not raise even though telegram_bot is None
+        tower.sync_equity("Trend", 8_500.0)
+        assert tower.risk_vault.can_trade("Trend") is False
+
+    def test_healthy_equity_update_sends_no_alert(self, library: Library):
+        telegram_bot = FakeTelegramBot()
+        tower, *_ = build_tower(library, candles=[], telegram_bot=telegram_bot)
+        tower.risk_vault.register_agent("Trend", starting_equity=10_000.0)
+
+        tower.sync_equity("Trend", 10_100.0)
+
+        assert telegram_bot.frozen_calls == []
+        assert telegram_bot.daily_halt_calls == []
+
+
+class TestSendDailySummary:
+    def test_sends_leaderboard_rows(self, library: Library, monkeypatch):
+        telegram_bot = FakeTelegramBot()
+        tower, *_ = build_tower(library, candles=[], telegram_bot=telegram_bot)
+
+        good = BacktestMetrics(sharpe=1.5, max_drawdown_pct=0.05, win_rate=0.6, trade_count=60, total_pips=300)
+        monkeypatch.setattr(orch_module, "run_backtest", lambda candles, config, **kw: BacktestResult(train=good, test=good, trades=[]))
+        tower.risk_vault.register_agent("Trend", starting_equity=10_000.0)
+        tower.run_research_cycle("Trend")
+
+        tower.send_daily_summary()
+
+        assert len(telegram_bot.daily_summary_calls) == 1
+        rows = telegram_bot.daily_summary_calls[0]
+        assert rows[0]["agent"] == "Trend"
+
+    def test_noop_when_no_telegram_bot_configured(self, library: Library):
+        tower, *_ = build_tower(library, candles=[])
+        tower.send_daily_summary()  # must not raise

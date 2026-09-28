@@ -57,11 +57,15 @@ def create_app(main_tower: MainTower, allow_origins: list[str] | None = None) ->
     @app.post("/api/kill-switch/activate")
     def activate_kill_switch() -> dict:
         main_tower.risk_vault.activate_kill_switch()
+        if main_tower.telegram_bot is not None:
+            main_tower.telegram_bot.notify_kill_switch(True)
         return {"active": True}
 
     @app.post("/api/kill-switch/deactivate")
     def deactivate_kill_switch() -> dict:
         main_tower.risk_vault.deactivate_kill_switch()
+        if main_tower.telegram_bot is not None:
+            main_tower.telegram_bot.notify_kill_switch(False)
         return {"active": False}
 
     @app.post("/api/agents/{agent_name}/unfreeze")

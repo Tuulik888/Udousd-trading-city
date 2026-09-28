@@ -34,4 +34,13 @@ def build_scheduler(
             id=f"trade-{name}",
             replace_existing=True,
         )
+
+    scheduler.add_job(
+        main_tower.send_daily_summary,
+        trigger="cron",
+        hour=0,
+        minute=0,
+        id="daily-summary",
+        replace_existing=True,
+    )
     return scheduler

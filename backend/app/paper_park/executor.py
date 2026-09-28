@@ -16,6 +16,7 @@ from app.backtest_lab.schema import StrategyConfig
 from app.library.repository import Library
 from app.news_tower.calendar import NewsCalendar
 from app.risk_vault.vault import RiskVault, RiskViolation
+from app.telegram_alerts.bot import TelegramBot
 
 
 @dataclass
@@ -35,6 +36,7 @@ class PaperPark:
         news_calendar: NewsCalendar,
         instrument: str = "EUR_USD",
         value_per_unit: float = 1.0,
+        telegram_bot: TelegramBot | None = None,
     ) -> None:
         self.oanda_client = oanda_client
         self.risk_vault = risk_vault
@@ -42,6 +44,7 @@ class PaperPark:
         self.news_calendar = news_calendar
         self.instrument = instrument
         self.value_per_unit = value_per_unit
+        self.telegram_bot = telegram_bot
 
     def evaluate_and_trade(
         self,
@@ -112,4 +115,8 @@ class PaperPark:
             oanda_trade_id=oanda_trade_id,
             reasoning=config.notes,
         )
+        if self.telegram_bot is not None:
+            self.telegram_bot.notify_trade_opened(
+                agent_name, self.instrument, last_signal, signed_units, entry_price
+            )
         return TradeDecision(True, direction=last_signal, reason="order placed", trade_id=trade_id)

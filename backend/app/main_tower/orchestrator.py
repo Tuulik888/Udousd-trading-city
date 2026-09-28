@@ -8,6 +8,7 @@ dashboard-visible activity status.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 
 from app.backtest_lab.engine import run_backtest
@@ -18,6 +19,7 @@ from app.paper_park.executor import PaperPark, TradeDecision
 from app.paper_park.promotion import passes_promotion_bar
 from app.research_lab.service import ResearchLab
 from app.risk_vault.vault import AgentStatus, RiskVault
+from app.telegram_alerts.bot import TelegramBot
 
 
 class AgentActivity(str, Enum):
@@ -38,6 +40,7 @@ class MainTower:
     instrument: str = "EUR_USD"
     backtest_candle_count: int = 500
     trade_candle_count: int = 200
+    telegram_bot: TelegramBot | None = None
 
     active_strategies: dict[str, StrategyConfig] = field(default_factory=dict)
     _activity: dict[str, AgentActivity] = field(default_factory=dict)
@@ -98,6 +101,37 @@ class MainTower:
             return self.paper_park.evaluate_and_trade(agent_name, config, candles)
         finally:
             self._activity[agent_name] = AgentActivity.IDLE
+
+    # ------------------------------------------------------------------
+    # Equity sync -> Risk Vault -> freeze/daily-halt alerts
+    # ------------------------------------------------------------------
+
+    def sync_equity(self, agent_name: str, new_equity: float, at: datetime | None = None) -> None:
+        """Feed a fresh equity reading into the Risk Vault, persist it,
+        and alert on any newly-triggered freeze or daily-loss halt."""
+        previous_status = self.risk_vault.get_state(agent_name).status
+        self.risk_vault.update_equity(agent_name, new_equity, now=at)
+        new_state = self.risk_vault.get_state(agent_name)
+        self.library.log_equity_snapshot(agent_name, new_equity, at=at)
+
+        if self.telegram_bot is None:
+            return
+        if new_state.status == AgentStatus.FROZEN and previous_status != AgentStatus.FROZEN:
+            self.telegram_bot.notify_agent_frozen(
+                agent_name, new_state.freeze_reason or "drawdown limit breached"
+            )
+        elif new_state.status == AgentStatus.DAILY_HALTED and previous_status == AgentStatus.ACTIVE:
+            self.telegram_bot.notify_daily_loss_halt(agent_name)
+
+    # ------------------------------------------------------------------
+    # Daily summary
+    # ------------------------------------------------------------------
+
+    def send_daily_summary(self) -> None:
+        if self.telegram_bot is None:
+            return
+        rows = self.library.get_leaderboard()
+        self.telegram_bot.notify_daily_summary(rows)
 
     # ------------------------------------------------------------------
 

@@ -24,6 +24,7 @@ from app.research_lab.claude_client import ClaudeClient
 from app.research_lab.personas import PERSONAS
 from app.research_lab.service import ResearchLab
 from app.risk_vault.vault import RiskVault
+from app.telegram_alerts.bot import TelegramBot
 
 logger = logging.getLogger("main_tower")
 
@@ -45,7 +46,14 @@ def build_main_tower() -> MainTower:
     news_calendar = NewsCalendar()
     claude_client = ClaudeClient(api_key=settings.anthropic_api_key, model=settings.anthropic_model)
     research_lab = ResearchLab(client=claude_client, library=library)
-    paper_park = PaperPark(oanda_client=oanda, risk_vault=risk_vault, library=library, news_calendar=news_calendar)
+    telegram_bot = TelegramBot(bot_token=settings.telegram_bot_token, chat_id=settings.telegram_chat_id)
+    paper_park = PaperPark(
+        oanda_client=oanda,
+        risk_vault=risk_vault,
+        library=library,
+        news_calendar=news_calendar,
+        telegram_bot=telegram_bot,
+    )
 
     tower = MainTower(
         research_lab=research_lab,
@@ -53,6 +61,7 @@ def build_main_tower() -> MainTower:
         data_hub=data_hub,
         library=library,
         risk_vault=risk_vault,
+        telegram_bot=telegram_bot,
     )
 
     starting_equity = DEFAULT_STARTING_EQUITY_PER_AGENT

@@ -40,6 +40,22 @@ class FakeOandaClient:
         return {"orderFillTransaction": {"tradeOpened": {"tradeID": "fake-trade-1"}}}
 
 
+class FakeTelegramBot:
+    def __init__(self) -> None:
+        self.trade_opened_calls: list[dict] = []
+
+    def notify_trade_opened(self, agent_name, instrument, direction, units, entry_price):
+        self.trade_opened_calls.append(
+            {
+                "agent_name": agent_name,
+                "instrument": instrument,
+                "direction": direction,
+                "units": units,
+                "entry_price": entry_price,
+            }
+        )
+
+
 @pytest.fixture()
 def library(tmp_path) -> Library:
     return Library(database_url=f"sqlite:///{tmp_path / 'test.db'}")
@@ -80,11 +96,19 @@ def trend_config() -> StrategyConfig:
     )
 
 
-def make_park(library: Library, oanda=None, vault=None, calendar=None) -> tuple[PaperPark, FakeOandaClient, RiskVault]:
+def make_park(
+    library: Library, oanda=None, vault=None, calendar=None, telegram_bot=None
+) -> tuple[PaperPark, FakeOandaClient, RiskVault]:
     oanda = oanda or FakeOandaClient()
     vault = vault or RiskVault(kill_switch_env_var="TEST_KILL_SWITCH_PP")
     calendar = calendar if calendar is not None else NewsCalendar([])
-    park = PaperPark(oanda_client=oanda, risk_vault=vault, library=library, news_calendar=calendar)
+    park = PaperPark(
+        oanda_client=oanda,
+        risk_vault=vault,
+        library=library,
+        news_calendar=calendar,
+        telegram_bot=telegram_bot,
+    )
     return park, oanda, vault
 
 
@@ -198,6 +222,27 @@ class TestPaperParkExecution:
         open_trades = library.get_open_trades("Trend")
         assert len(open_trades) == 1
         assert open_trades[0]["oanda_trade_id"] == "fake-trade-1"
+
+    def test_successful_trade_notifies_telegram(self, library: Library):
+        telegram_bot = FakeTelegramBot()
+        park, oanda, vault = make_park(library, telegram_bot=telegram_bot)
+        vault.register_agent("Trend", starting_equity=10_000.0)
+
+        park.evaluate_and_trade("Trend", trend_config(), rallying_candles())
+
+        assert len(telegram_bot.trade_opened_calls) == 1
+        assert telegram_bot.trade_opened_calls[0]["agent_name"] == "Trend"
+        assert telegram_bot.trade_opened_calls[0]["direction"] == 1
+
+    def test_blocked_trade_does_not_notify_telegram(self, library: Library):
+        telegram_bot = FakeTelegramBot()
+        park, oanda, vault = make_park(library, telegram_bot=telegram_bot)
+        vault.register_agent("Trend", starting_equity=10_000.0)
+        vault.activate_kill_switch()
+
+        park.evaluate_and_trade("Trend", trend_config(), rallying_candles())
+
+        assert telegram_bot.trade_opened_calls == []
 
     def test_order_units_respect_risk_cap(self, library: Library):
         park, oanda, vault = make_park(library)
