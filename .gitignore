@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Env / secrets
+.env
+.env.local
+
+# DB
+*.db
+*.sqlite3
+
+# Data cache
+backend/app/data_hub/cache/
+*.parquet
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dashboard/.env*.local
+
+# OS
+.DS_Store
